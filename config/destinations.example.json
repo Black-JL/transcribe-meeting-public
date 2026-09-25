@@ -1,0 +1,10 @@
+{
+  "_comment": "Where the app can file a copy of your meeting notes. Edit paths to suit. {year} is replaced with the meeting's year, and the folder is created if needed. Set \"default\": true on the one you use most.",
+  "destinations": [
+    {
+      "name": "Notes archive",
+      "path": "/Users/you/Documents/Meeting Notes/{year}",
+      "default": true
+    }
+  ]
+}

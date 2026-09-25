@@ -1,0 +1,53 @@
+#!/bin/zsh
+# Auto-process watcher: scans the Meetings folder and runs the full pipeline
+# (transcribe + diarize + local-AI meeting notes) on any audio/video file that
+# doesn't yet have notes. Also self-heals: if a transcript exists but notes
+# don't, it just generates the notes. Idempotent and single-instance.
+# Triggered by launchd on folder changes (and on a periodic fallback).
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+DIR="$HOME/Documents/Transcribed Meetings"
+LOG="$HOME/Library/Logs/transcribe-meeting.log"
+LOCKDIR="$HOME/.config/transcribe-meeting/watch.lockdir"
+TOOL="$HOME/.local/bin/transcribe-meeting"
+NOTES="$HOME/.local/bin/meeting-notes"
+mkdir -p "$DIR" "$HOME/.config/transcribe-meeting"
+
+# single instance (mkdir is atomic; macOS has no flock)
+mkdir "$LOCKDIR" 2>/dev/null || exit 0
+trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+
+logmsg() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') [watch] $*" >> "$LOG"; }
+
+now=$(date +%s)
+setopt NULL_GLOB
+
+# 1) New media files -> full pipeline
+for f in "$DIR"/*.wav "$DIR"/*.m4a "$DIR"/*.mp3 "$DIR"/*.mp4 "$DIR"/*.mov "$DIR"/*.aac "$DIR"/*.aiff "$DIR"/*.caf; do
+  [[ -f "$f" ]] || continue
+  stem="${f:r}"
+  [[ -f "${stem}.notes.md" ]] && continue               # fully processed
+  [[ -f "${stem}.transcript.md" ]] && continue          # transcript exists; handled in pass 2
+  mtime=$(stat -f %m "$f" 2>/dev/null) || continue
+  (( now - mtime < 90 )) && continue                     # still being written / app handling it
+  logmsg "auto-processing: $f"
+  if "$TOOL" "$f" >/dev/null 2>>"$LOG"; then
+    logmsg "auto-processed OK: $f"
+  else
+    logmsg "auto-process FAILED: $f"
+  fi
+done
+
+# 2) Transcripts missing notes -> generate notes only (self-heal)
+for t in "$DIR"/*.transcript.md; do
+  [[ -f "$t" ]] || continue
+  base="${t%.transcript.md}"
+  [[ -f "${base}.notes.md" ]] && continue
+  mtime=$(stat -f %m "$t" 2>/dev/null) || continue
+  (( now - mtime < 90 )) && continue
+  logmsg "generating missing notes: $t"
+  if "$NOTES" "$t" >/dev/null 2>>"$LOG"; then
+    logmsg "notes OK: ${base}.notes.md"
+  else
+    logmsg "notes FAILED: $t"
+  fi
+done
