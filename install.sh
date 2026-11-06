@@ -1,7 +1,7 @@
 #!/bin/zsh
 # One-command installer for Transcribe Meeting.
 # Works on any Apple Silicon Mac (M1–M5, incl. Mac Studio). Fully local:
-# parakeet-mlx runs transcription on the GPU; sherpa-onnx does speaker labels
+# Voz (`da`, Desert Ant Labs) transcribes on the Neural Engine; sherpa-onnx does speaker labels
 # with models from GitHub (no Hugging Face account/token).
 set -e
 KIT="$(cd "$(dirname "$0")" && pwd)"
@@ -18,14 +18,23 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   else echo "WARNING: ffmpeg missing and no Homebrew. Install ffmpeg manually."; fi
 fi
 
-# 3. Python deps
-echo "==> Installing Python packages (parakeet-mlx, sherpa-onnx, soundfile)"
-"$PYBIN" -m pip install --upgrade parakeet-mlx sherpa-onnx soundfile
+# 3. Speech engine: Voz via the Desert Ant CLI (`da`), then Python deps
+if ! command -v da >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then brew install desert-ant-labs/tap/desertant
+  else echo "ERROR: Homebrew is needed to install the Voz engine (desertant)."; exit 1; fi
+fi
+echo "==> Downloading the Voz model once (~340 MB)"
+da pull voz --quiet
+echo "==> Installing Python packages (sherpa-onnx, soundfile, python-docx, mlx-whisper for the owner-line check)"
+"$PYBIN" -m pip install --upgrade sherpa-onnx soundfile python-docx mlx-whisper
 
 # 4. Pipeline + notes generator + CLI wrappers
 mkdir -p "$HOME/.claude/tools" "$HOME/.local/bin" "$HOME/.config/transcribe-meeting"
 cp "$KIT/transcribe_meeting.py" "$HOME/.claude/tools/transcribe_meeting.py"
 cp "$KIT/meeting_notes.py" "$HOME/.claude/tools/meeting_notes.py"
+cp "$KIT/notes_docx.py" "$HOME/.claude/tools/notes_docx.py"
+cp "$KIT/enroll_voice.py" "$HOME/.claude/tools/enroll_voice.py"
+cp "$KIT/owner_check.py" "$HOME/.claude/tools/owner_check.py"
 cp "$KIT/tm-watch" "$HOME/.local/bin/tm-watch"; chmod +x "$HOME/.local/bin/tm-watch"
 [[ -f "$HOME/.config/transcribe-meeting/glossary.md" ]] || \
   cp "$KIT/config/glossary.example.md" "$HOME/.config/transcribe-meeting/glossary.md"
@@ -39,8 +48,12 @@ cat > "$HOME/.local/bin/meeting-notes" <<EOF
 #!/bin/zsh
 exec "$PYBIN" "\$HOME/.claude/tools/meeting_notes.py" "\$@"
 EOF
-chmod +x "$HOME/.local/bin/transcribe-meeting" "$HOME/.local/bin/meeting-notes"
-echo "==> CLIs installed: ~/.local/bin/{transcribe-meeting,meeting-notes}"
+cat > "$HOME/.local/bin/enroll-voice" <<EOF
+#!/bin/zsh
+exec "$PYBIN" "\$HOME/.claude/tools/enroll_voice.py" "\$@"
+EOF
+chmod +x "$HOME/.local/bin/transcribe-meeting" "$HOME/.local/bin/meeting-notes" "$HOME/.local/bin/enroll-voice"
+echo "==> CLIs installed: ~/.local/bin/{transcribe-meeting,meeting-notes,enroll-voice}"
 
 # 4b. Local LLM for meeting notes (Ollama + gpt-oss:20b)
 NOTES_MODEL="${TM_NOTES_MODEL:-gpt-oss:20b}"
@@ -82,4 +95,4 @@ echo "    App:  ~/Applications/Transcribe Meeting.app   (double-click)"
 echo "    CLI:  transcribe-meeting /path/to/recording.m4a   (transcript + meeting notes)"
 echo "    Each meeting yields: recording, <name>.transcript.md, and <name>.notes.md"
 echo "    Files live in: ~/Documents/Transcribed Meetings/"
-echo "    First run downloads the parakeet model (~1–2 GB) once, then it's cached."
+echo "    The Voz speech model is already downloaded; transcription runs offline."

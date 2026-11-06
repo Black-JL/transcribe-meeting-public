@@ -5,6 +5,8 @@
 import SwiftUI
 import AVFoundation
 import AppKit
+import Vision
+import CoreAudio
 
 // MARK: - Model
 
@@ -32,7 +34,13 @@ struct Destination: Identifiable, Hashable {
 // MARK: - Engine
 
 final class Engine: NSObject, ObservableObject {
+    static weak var shared: Engine?
+    override init() { super.init(); Engine.shared = self }
+
     @Published var isRecording = false
+    @Published var online = UserDefaults.standard.bool(forKey: "onlineMeeting") {
+        didSet { UserDefaults.standard.set(online, forKey: "onlineMeeting") }
+    }
     @Published var busy = false
     @Published var status = "Ready — record a meeting or transcribe a file."
     @Published var stage = ""
@@ -44,15 +52,51 @@ final class Engine: NSObject, ObservableObject {
     @Published var selectedDestination: Destination?
     @Published var actionMsg = ""
     @Published var notesModels: [String] = []
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "notesModel") ?? "gpt-oss:20b" {
+    // Notes writer: "claude" (online, default) or an Ollama model (offline).
+    // notesModelV2: one-time switch of existing installs to Claude (2026-10-21).
+    @Published var selectedModel: String = Engine.initialModel() {
         didSet { UserDefaults.standard.set(selectedModel, forKey: "notesModel") }
+    }
+    // Sensitive meetings (e.g. about students or patients): notes never go to Claude.
+    @Published var sensitive = false
+    private var lastRunSensitive = false   // the switch as it was when the notes were made
+    // Intake: asked after Stop (or after choosing a file), before notes are written.
+    @Published var myNotes = ""          // typed live while recording, or after
+    @Published var attendees = ""
+    @Published var speakers = 0          // 0 = let the software count
+    @Published var meetingType = "auto"
+    @Published var showIntake = false
+    @Published var ocrBusy = false
+    private var pending: (url: URL, title: String, system: URL?, outDir: URL?)?
+    @Published var pendingIsImport = false
+    @Published var recorderMounted = false
+    @Published var importQueue: [URL] = []
+    @Published var inputDevice = ""
+
+    static func initialModel() -> String {
+        let d = UserDefaults.standard
+        if !d.bool(forKey: "notesModelV2") {
+            d.set(true, forKey: "notesModelV2")
+            d.set("claude", forKey: "notesModel")
+            return "claude"
+        }
+        return d.string(forKey: "notesModel") ?? "claude"
+    }
+
+    static func modelLabel(_ m: String) -> String {
+        m == "claude" ? "Claude (online)" : "\(m) (offline)"
     }
 
     private var recorder: AVAudioRecorder?
+    private let sysRec = SystemAudioRecorder()
     private var currentURL: URL?
+    private var systemURL: URL?
     private var proc: Process?
     private var timer: Timer?
-    private var lastActivity = Date()
+    // Watchdog clock: systemUptime does not advance while the Mac sleeps, so a
+    // closed lid no longer looks like a stalled job.
+    private var lastActivity = ProcessInfo.processInfo.systemUptime
+    private var sleepBlock: NSObjectProtocol?
 
     var meetingsDir: URL {
         let d = FileManager.default.homeDirectoryForCurrentUser
@@ -91,21 +135,29 @@ final class Engine: NSObject, ObservableObject {
         let stamp = df.string(from: Date())
         let name = sanitized(meetingName)
         let stem = name.isEmpty ? "Meeting \(stamp)" : "\(name) — \(stamp)"
-        let url = meetingsDir.appendingPathComponent("\(stem).wav")
+        // AAC .m4a: ~15 MB/hour instead of ~115 MB/hour for WAV; same transcript.
+        let url = meetingsDir.appendingPathComponent("\(stem).m4a")
         let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatLinearPCM),
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
             AVSampleRateKey: 16000.0,
             AVNumberOfChannelsKey: 1,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsBigEndianKey: false,
+            AVEncoderBitRateKey: 32000,
         ]
         do {
             let r = try AVAudioRecorder(url: url, settings: settings)
             guard r.record() else { status = "Could not start recording."; return }
+            if online {
+                let sysURL = meetingsDir.appendingPathComponent("\(stem).system.m4a")
+                do { try sysRec.start(to: sysURL); systemURL = sysURL } catch {
+                    r.stop()
+                    status = "Couldn’t record the call audio: \(error.localizedDescription) Allow Transcribe Meeting under System Settings ▸ Privacy & Security ▸ Screen & System Audio Recording."
+                    return
+                }
+            } else { systemURL = nil }
             recorder = r; currentURL = url
             isRecording = true
-            status = "● Recording…  click Stop when the meeting ends."
+            status = online ? "● Recording you and the call audio…  click Stop when the meeting ends."
+                            : "● Recording…  click Stop when the meeting ends."
             startTimer()
         } catch {
             status = "Could not start recording: \(error.localizedDescription)"
@@ -114,6 +166,7 @@ final class Engine: NSObject, ObservableObject {
 
     func stopRecording() {
         recorder?.stop(); recorder = nil; isRecording = false
+        if systemURL != nil { sysRec.stop() }
         stopTimer()
         guard let url = currentURL else { return }
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int ?? 0
@@ -121,7 +174,189 @@ final class Engine: NSObject, ObservableObject {
             status = "The recording was silent. Check System Settings ▸ Sound ▸ Input (use your real mic, not muted/virtual), then try again."
             return
         }
-        runPipeline(url, title: meetingName.isEmpty ? url.deletingPathExtension().lastPathComponent : meetingName)
+        pending = (url, meetingName.isEmpty ? url.deletingPathExtension().lastPathComponent : meetingName,
+                   systemURL, nil)
+        pendingIsImport = false
+        // Hold marker: the folder watcher leaves this file alone while you add notes.
+        FileManager.default.createFile(atPath: url.deletingPathExtension().path + ".hold", contents: nil)
+        showIntake = true
+    }
+
+    /// Called from the intake panel.
+    func finishIntake(skip: Bool, notNow: Bool = false) {
+        showIntake = false
+        guard let p = pending else { return }
+        pending = nil
+        let title = (pendingIsImport && !meetingName.isEmpty) ? meetingName : p.title
+        if notNow {
+            // ".later": the folder watcher never auto-processes it; you decide.
+            let stem = (p.outDir ?? p.url.deletingLastPathComponent())
+                .appendingPathComponent(p.url.deletingPathExtension().lastPathComponent).path
+            FileManager.default.createFile(atPath: stem + ".later", contents: nil)
+            try? FileManager.default.removeItem(atPath: p.url.deletingPathExtension().path + ".hold")
+            myNotes = ""; attendees = ""; speakers = 0; meetingType = "auto"
+            if pendingIsImport { meetingName = "" }
+            status = "Left for later: \(p.url.lastPathComponent). Use Transcribe a File… when ready."
+            nextImport()
+            return
+        }
+        var extra: [String] = []
+        if let o = p.outDir { extra += ["--out", o.path] }
+        if !skip {
+            let names = attendees.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !names.isEmpty { extra += ["--attendees", names] }
+            if speakers > 0 { extra += ["--speakers", String(speakers)] }
+            else if !names.isEmpty {
+                // No count picked: use the number of attendee names typed.
+                let n = names.split(whereSeparator: { $0 == "," || $0 == ";" || $0 == "\n" })
+                    .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.count
+                if n > 1 { extra += ["--speakers", String(n)] }
+            }
+            if meetingType != "auto" { extra += ["--type", meetingType] }
+            let notes = myNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !notes.isEmpty {
+                let stem = p.url.deletingPathExtension().lastPathComponent
+                let f = meetingsDir.appendingPathComponent("\(stem).my-notes.md")
+                try? notes.write(to: f, atomically: true, encoding: .utf8)
+                extra += ["--my-notes", f.path]
+            }
+        }
+        myNotes = ""; attendees = ""; speakers = 0; meetingType = "auto"
+        if pendingIsImport { meetingName = "" }
+        runPipeline(p.url, title: title, system: p.system, extra: extra)
+    }
+
+    /// Read a photo of handwritten or printed notes on this Mac (Apple Vision).
+    func addNotesPhoto() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = true
+        panel.message = "Choose a photo of your notes"
+        guard panel.runModal() == .OK else { return }
+        let urls = panel.urls
+        ocrBusy = true
+        DispatchQueue.global().async {
+            let text = urls.map { Engine.recognizeText($0) }.filter { !$0.isEmpty }.joined(separator: "\n")
+            DispatchQueue.main.async {
+                self.ocrBusy = false
+                if text.isEmpty { self.actionMsg = "Couldn’t read any text in that photo."; return }
+                self.myNotes += (self.myNotes.isEmpty || self.myNotes.hasSuffix("\n") ? "" : "\n") + text
+            }
+        }
+    }
+
+    static func recognizeText(_ url: URL) -> String {
+        guard let img = NSImage(contentsOf: url),
+              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return "" }
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate
+        req.usesLanguageCorrection = true
+        try? VNImageRequestHandler(cgImage: cg, options: [:]).perform([req])
+        return (req.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+    }
+
+    /// Start macOS dictation in whichever text box has focus.
+    func dictate() {
+        NSApp.sendAction(Selector(("startDictation:")), to: nil, from: nil)
+    }
+
+    /// Quit cleanly: stop recording, stop any running pipeline.
+    func shutdown() {
+        if isRecording { recorder?.stop(); if systemURL != nil { sysRec.stop() } }
+        proc?.terminate()
+    }
+
+    // MARK: Philips VoiceTracer (or any recorder with a VOICE folder)
+
+    func recorderVoiceDirs() -> [URL] {
+        let fm = FileManager.default
+        let vols = (try? fm.contentsOfDirectory(atPath: "/Volumes")) ?? []
+        var out: [URL] = []
+        for v in vols {
+            let voice = URL(fileURLWithPath: "/Volumes/\(v)/VOICE")
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: voice.path, isDirectory: &isDir), isDir.boolValue {
+                for sub in ((try? fm.contentsOfDirectory(atPath: voice.path)) ?? []).sorted() {
+                    out.append(voice.appendingPathComponent(sub))
+                }
+            }
+        }
+        return out
+    }
+
+    func checkRecorder() { recorderMounted = !recorderVoiceDirs().isEmpty }
+
+    /// Copy new recordings off the recorder, verify each copy, never delete from it.
+    func importFromRecorder() {
+        let fm = FileManager.default
+        let dest = meetingsDir.appendingPathComponent("Recorder")
+        try? fm.createDirectory(at: dest, withIntermediateDirectories: true)
+        let audio: Set<String> = ["mp3", "wav"]
+        var copied: [URL] = [], failed = 0, already = 0
+        for dir in recorderVoiceDirs() {
+            let folder = dir.lastPathComponent
+            for name in ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).sorted() {
+                let src = dir.appendingPathComponent(name)
+                guard audio.contains(src.pathExtension.lowercased()) else { continue }
+                let attrs = try? fm.attributesOfItem(atPath: src.path)
+                let size = (attrs?[.size] as? Int) ?? 0
+                if size < 32_000 { continue }                       // under a second or two
+                let when = (attrs?[.modificationDate] as? Date) ?? Date()
+                let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd HH.mm"
+                let base = "Recorder \(df.string(from: when)) (\(folder) \(src.deletingPathExtension().lastPathComponent))"
+                let target = dest.appendingPathComponent(base + "." + src.pathExtension.lowercased())
+                if fm.fileExists(atPath: target.path) {
+                    if fm.contentsEqual(atPath: src.path, andPath: target.path) { already += 1; continue }
+                }
+                do {
+                    if fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
+                    try fm.copyItem(at: src, to: target)
+                    if fm.contentsEqual(atPath: src.path, andPath: target.path) { copied.append(target) }
+                    else { failed += 1; try? fm.removeItem(at: target) }
+                } catch { failed += 1 }
+            }
+        }
+        var msg = "Copied \(copied.count) new recording\(copied.count == 1 ? "" : "s") from the recorder (each copy checked; nothing deleted from the recorder)."
+        if already > 0 { msg += " \(already) already copied before." }
+        if failed > 0 { msg += " \(failed) FAILED to copy — leave them on the recorder." }
+        status = msg; actionMsg = msg
+        importQueue = copied
+        nextImport()
+    }
+
+    /// Open the notes panel for the next imported recording, if any.
+    func nextImport() {
+        guard !busy, !showIntake, !importQueue.isEmpty else { return }
+        let url = importQueue.removeFirst()
+        pending = (url, url.deletingPathExtension().lastPathComponent, nil, meetingsDir)
+        pendingIsImport = true
+        meetingName = ""
+        showIntake = true
+    }
+
+    /// Name of the microphone macOS will record from (the system default input).
+    func refreshInputDevice() {
+        var dev = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev) == noErr
+        else { inputDevice = ""; return }
+        var name: Unmanaged<CFString>?
+        var nsize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var naddr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName,
+                                               mScope: kAudioObjectPropertyScopeGlobal,
+                                               mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectGetPropertyData(dev, &naddr, 0, nil, &nsize, &name) == noErr, let n = name {
+            inputDevice = n.takeRetainedValue() as String
+        }
+    }
+
+    func openSoundInput() {
+        if let u = URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension?input") {
+            NSWorkspace.shared.open(u)
+        }
     }
 
     // MARK: File import
@@ -132,31 +367,43 @@ final class Engine: NSObject, ObservableObject {
         panel.canChooseDirectories = false
         panel.message = "Choose an audio or video file to transcribe"
         if panel.runModal() == .OK, let url = panel.url {
-            runPipeline(url, title: url.deletingPathExtension().lastPathComponent)
+            pending = (url, url.deletingPathExtension().lastPathComponent, nil, nil)
+            pendingIsImport = false
+            FileManager.default.createFile(atPath: url.deletingPathExtension().path + ".hold", contents: nil)
+            showIntake = true
         }
     }
 
     // MARK: Pipeline (transcribe → notes). Robust: drains stderr, watchdog.
 
-    private func runPipeline(_ url: URL, title: String) {
+    private func runPipeline(_ url: URL, title: String, system: URL? = nil, extra: [String] = []) {
         busy = true; elapsed = 0; stage = "Starting…"; actionMsg = ""
-        status = "Processing “\(title)” …"
+        lastRunSensitive = sensitive
+        status = "Processing “\(title)” … Keep the lid open or stay plugged in until it finishes."
         startTimer()
-        lastActivity = Date()
+        lastActivity = ProcessInfo.processInfo.systemUptime
+        // Keep the Mac from idle-sleeping while the job runs. (Closing the lid on
+        // battery still forces sleep; the watchdog clock above tolerates that.)
+        sleepBlock = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled],
+            reason: "Transcribing a meeting")
 
         DispatchQueue.global().async {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: self.tool)
             p.arguments = [url.path, "--title", title, "--notes-model", self.selectedModel]
+                + (system.map { ["--system", $0.path] } ?? [])
+                + (self.sensitive ? ["--sensitive"] : [])
+                + extra
             let outPipe = Pipe(); let errPipe = Pipe()
             p.standardOutput = outPipe; p.standardError = errPipe
 
-            // Drain stderr live (large: parakeet/ffmpeg/notes progress) so the
+            // Drain stderr live (large: Voz/ffmpeg/notes progress) so the
             // child never blocks on a full pipe buffer. Map lines to stages.
             errPipe.fileHandleForReading.readabilityHandler = { fh in
                 let d = fh.availableData
                 if d.isEmpty { return }
-                self.lastActivity = Date()
+                self.lastActivity = ProcessInfo.processInfo.systemUptime
                 if let s = String(data: d, encoding: .utf8) {
                     for line in s.split(separator: "\n") {
                         if let friendly = self.friendlyStage(String(line)) {
@@ -198,6 +445,7 @@ final class Engine: NSObject, ObservableObject {
                     self.status = "Processing didn’t finish. See ~/Library/Logs/transcribe-meeting.log"
                     self.stage = ""
                 }
+                self.nextImport()
             }
         }
     }
@@ -205,7 +453,7 @@ final class Engine: NSObject, ObservableObject {
     private func friendlyStage(_ line: String) -> String? {
         let l = line.lowercased()
         if l.contains("converting audio") { return "Step 1 of 4 — preparing audio…" }
-        if l.contains("transcribing with parakeet") { return "Step 2 of 4 — transcribing on the GPU (the long part)…" }
+        if l.contains("transcribing with voz") { return "Step 2 of 4 — transcribing on the Neural Engine…" }
         if l.contains("transcribed") && l.contains("words") { return "Step 2 of 4 — transcribed; tidying up…" }
         if l.contains("diarizing") { return "Step 3 of 4 — identifying who spoke…" }
         if l.contains("generating meeting notes") { return "Step 4 of 4 — writing meeting notes (local AI)…" }
@@ -219,14 +467,17 @@ final class Engine: NSObject, ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             if self.isRecording || self.busy { self.elapsed += 1 }
-            if self.busy, Date().timeIntervalSince(self.lastActivity) > 1200 {
+            if self.busy, ProcessInfo.processInfo.systemUptime - self.lastActivity > 1200 {
                 self.proc?.terminate()
                 self.status = "Processing stalled and was stopped. See the log."
                 self.busy = false; self.stopTimer()
             }
         }
     }
-    private func stopTimer() { timer?.invalidate(); timer = nil }
+    private func stopTimer() {
+        timer?.invalidate(); timer = nil
+        if let b = sleepBlock { ProcessInfo.processInfo.endActivity(b); sleepBlock = nil }
+    }
 
     // MARK: History + helpers
 
@@ -288,9 +539,18 @@ final class Engine: NSObject, ObservableObject {
                let arr = obj["models"] as? [[String: Any]] {
                 names = arr.compactMap { $0["name"] as? String }.sorted()
             }
+            // Show only the offline models listed in notes-models.txt (if present).
+            let listURL = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config/transcribe-meeting/notes-models.txt")
+            if let txt = try? String(contentsOf: listURL, encoding: .utf8) {
+                let wanted = txt.split(separator: "\n")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+                names = names.filter { wanted.contains($0) }
+            }
             DispatchQueue.main.async {
-                if names.isEmpty { names = [self.selectedModel] }
-                if !names.contains(self.selectedModel) { names.insert(self.selectedModel, at: 0) }
+                names = ["claude"] + names
+                if !names.contains(self.selectedModel) { self.selectedModel = "claude" }
                 self.notesModels = names
             }
         }.resume()
@@ -307,6 +567,12 @@ final class Engine: NSObject, ObservableObject {
     /// meeting-log naming convention. Returns nothing; sets actionMsg.
     func fileToDestination() {
         guard !notesPath.isEmpty, let dest = selectedDestination else { return }
+        // Box meeting folders are searched by the knowledge base. Student meetings stay out
+        // until someone reviews and de-identifies them (FERPA).
+        if (sensitive || lastRunSensitive) && dest.pathTemplate.contains("Box-Box") {
+            actionMsg = "Not filed: this meeting involves students, and your knowledge base searches the Box folders. Review and de-identify it first."
+            return
+        }
         let notes = URL(fileURLWithPath: notesPath)
         let fm = FileManager.default
         let date = (try? notes.resourceValues(forKeys: [.contentModificationDateKey]))?
@@ -362,6 +628,12 @@ final class Engine: NSObject, ObservableObject {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(body, forType: .string)
     }
+    func docxFor(_ notes: URL) -> URL? {
+        guard notes.lastPathComponent.hasSuffix(".notes.md") else { return nil }
+        let d = notes.deletingPathExtension().appendingPathExtension("docx")
+        return FileManager.default.fileExists(atPath: d.path) ? d : nil
+    }
+
     func transcriptFor(_ notes: URL) -> URL? {
         guard notes.lastPathComponent.hasSuffix(".notes.md") else { return nil }
         let stem = String(notes.lastPathComponent.dropLast(".notes.md".count))
@@ -376,6 +648,72 @@ final class Engine: NSObject, ObservableObject {
 }
 
 // MARK: - Views
+
+struct IntakeSheet: View {
+    @ObservedObject var engine: Engine
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Before I write the notes").font(.title3).fontWeight(.semibold)
+            Text("All optional. Anything you add makes the notes more accurate.")
+                .font(.caption).foregroundStyle(.secondary)
+            if engine.pendingIsImport {
+                Text("Meeting name").fontWeight(.medium)
+                TextField("e.g. Weekly team sync", text: $engine.meetingName)
+                    .textFieldStyle(.roundedBorder)
+            }
+            Toggle(isOn: $engine.sensitive) {
+                Text("Involves students — keep everything offline (notes by the Mac's own AI)").fontWeight(.medium)
+            }.toggleStyle(.checkbox)
+
+            Text("Who was in the room").fontWeight(.medium)
+            TextField("e.g. Pat Lee, Sam Ortiz, Dr. Rivera", text: $engine.attendees)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Text("People who spoke")
+                Picker("", selection: $engine.speakers) {
+                    Text("Let it count").tag(0)
+                    ForEach(1..<13) { n in Text("\(n)").tag(n) }
+                }.labelsHidden().frame(width: 130)
+                Spacer()
+                Text("Type")
+                Picker("", selection: $engine.meetingType) {
+                    Text("Let it decide").tag("auto")
+                    Text("Handover").tag("handover")
+                    Text("AAR").tag("aar")
+                    Text("Committee / board").tag("committee")
+                    Text("Debrief (just me)").tag("debrief")
+                    Text("General").tag("general")
+                }.labelsHidden().frame(width: 150)
+            }.font(.callout)
+
+            Text("My key notes").fontWeight(.medium)
+            Text("The 4–6 points that mattered most. Type, paste, add a photo of handwritten notes, or dictate.")
+                .font(.caption).foregroundStyle(.secondary)
+            TextEditor(text: $engine.myNotes)
+                .font(.body).frame(minHeight: 140)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
+            HStack {
+                Button { engine.addNotesPhoto() } label: { Label("Add Photo of Notes…", systemImage: "camera") }
+                    .disabled(engine.ocrBusy)
+                Button { engine.dictate() } label: { Label("Dictate", systemImage: "mic") }
+                    .help("Click in the notes box first, then Dictate (or press the dictation key)")
+                if engine.ocrBusy { ProgressView().controlSize(.small); Text("Reading photo…").font(.caption) }
+                Spacer()
+            }.controlSize(.small)
+
+            HStack {
+                Button("Not Now") { engine.finishIntake(skip: true, notNow: true) }
+                    .help("Leave this recording unprocessed for now")
+                Button("Skip Questions") { engine.finishIntake(skip: true) }
+                Spacer()
+                Button("Write Notes") { engine.finishIntake(skip: false) }
+                    .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20).frame(width: 480)
+    }
+}
 
 struct ContentView: View {
     @StateObject var engine = Engine()
@@ -394,7 +732,14 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 500, minHeight: 580)
-        .onAppear { engine.loadHistory(); engine.loadDestinations(); engine.loadModels() }
+        .sheet(isPresented: $engine.showIntake) { IntakeSheet(engine: engine) }
+        .onAppear {
+            engine.loadHistory(); engine.loadDestinations(); engine.loadModels()
+            engine.checkRecorder(); engine.refreshInputDevice()
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in engine.checkRecorder() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in engine.checkRecorder() }
+        .onReceive(NSApplication.shared.publisher(for: \.isActive)) { _ in engine.refreshInputDevice() }
     }
 
     private var header: some View {
@@ -419,6 +764,17 @@ struct ContentView: View {
             TextField("Meeting name (optional) — e.g. “Weekly team sync”", text: $engine.meetingName)
                 .textFieldStyle(.roundedBorder)
                 .disabled(engine.isRecording || engine.busy)
+            Picker("", selection: $engine.online) {
+                Text("In the room").tag(false)
+                Text("Online (video call)").tag(true)
+            }
+            .pickerStyle(.segmented).labelsHidden()
+            .disabled(engine.isRecording || engine.busy)
+            if engine.online {
+                Text("Wear headphones so the call doesn’t echo into your mic.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             Button(action: { engine.toggleRecord() }) {
                 Label(engine.isRecording ? "Stop Recording" : "Record New Meeting",
                       systemImage: engine.isRecording ? "stop.circle.fill" : "mic.circle.fill")
@@ -427,6 +783,13 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent).tint(engine.isRecording ? .red : .accentColor)
             .disabled(engine.busy)
+            if engine.recorderMounted {
+                Button(action: { engine.importFromRecorder() }) {
+                    Label("Import from Recorder", systemImage: "externaldrive.badge.plus")
+                        .frame(maxWidth: .infinity).padding(.vertical, 5)
+                }
+                .buttonStyle(.bordered).disabled(engine.busy || engine.isRecording)
+            }
             Button(action: { engine.pickAndTranscribe() }) {
                 Label("Transcribe a File…", systemImage: "doc.text.magnifyingglass")
                     .frame(maxWidth: .infinity).padding(.vertical, 5)
@@ -434,16 +797,35 @@ struct ContentView: View {
             .buttonStyle(.bordered).disabled(engine.busy || engine.isRecording)
 
             HStack(spacing: 6) {
+                Image(systemName: "mic").foregroundStyle(.secondary)
+                Text(engine.inputDevice.isEmpty ? "Microphone: unknown" : "Microphone: \(engine.inputDevice)")
+                    .foregroundStyle(.secondary).lineLimit(1)
+                Button("Change…") { engine.openSoundInput() }.buttonStyle(.link)
+                Spacer()
+            }
+            .controlSize(.small).font(.caption)
+            HStack(spacing: 6) {
                 Image(systemName: "brain").foregroundStyle(.secondary)
                 Text("Notes AI").foregroundStyle(.secondary)
                 Picker("", selection: $engine.selectedModel) {
-                    ForEach(engine.notesModels, id: \.self) { Text($0).tag($0) }
+                    ForEach(engine.notesModels, id: \.self) { Text(Engine.modelLabel($0)).tag($0) }
                 }.labelsHidden()
                 Button { engine.loadModels() } label: { Image(systemName: "arrow.clockwise") }
-                    .help("Refresh model list from Ollama")
+                    .help("Refresh the list of offline models")
             }
             .controlSize(.small).font(.caption)
             .disabled(engine.busy || engine.isRecording)
+            Toggle(isOn: $engine.sensitive) {
+                Text("Involves students — keep notes offline")
+            }
+            .toggleStyle(.checkbox).controlSize(.small).font(.caption)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .disabled(engine.busy || engine.isRecording)
+            if engine.sensitive && engine.selectedModel == "claude" {
+                Text("Notes will be written by gpt-oss:20b on this Mac, not Claude.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .padding(16).background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
     }
@@ -464,6 +846,14 @@ struct ContentView: View {
             Text(engine.status).font(.callout).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
+            if engine.isRecording {
+                Text("My notes — jot the 4–6 points that matter; the AI expands them from the recording.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                TextEditor(text: $engine.myNotes)
+                    .font(.body).frame(minHeight: 90)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
+            }
         }
         .padding(14).background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
     }
@@ -479,6 +869,9 @@ struct ContentView: View {
                 .foregroundStyle(.secondary).textSelection(.enabled).lineLimit(2)
             HStack {
                 Button { engine.open(primary) } label: { Label(isNotes ? "Open Notes" : "Open", systemImage: "doc.richtext") }
+                if isNotes, let docx = engine.docxFor(primary) {
+                    Button { engine.open(docx) } label: { Label("Open in Word", systemImage: "doc.text") }
+                }
                 if let t = transcript {
                     Button { engine.open(t) } label: { Label("Open Transcript", systemImage: "doc.plaintext") }
                 }
@@ -560,8 +953,13 @@ struct ContentView: View {
     }
 }
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) { Engine.shared?.shutdown() }
+}
+
 @main
 struct TranscribeMeetingApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     init() { NSApplication.shared.setActivationPolicy(.regular) }
     var body: some Scene {
         WindowGroup { ContentView() }

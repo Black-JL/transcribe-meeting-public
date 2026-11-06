@@ -16,6 +16,10 @@ mkdir -p "$DIR" "$HOME/.config/transcribe-meeting"
 mkdir "$LOCKDIR" 2>/dev/null || exit 0
 trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
 
+# A hold marker younger than 12 h means "being handled"; older ones are stale
+# (e.g. the app quit with the notes panel open) and are ignored.
+held() { [[ -f "$1" ]] && (( $(date +%s) - $(stat -f %m "$1") < 43200 )); }
+
 logmsg() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') [watch] $*" >> "$LOG"; }
 
 now=$(date +%s)
@@ -24,8 +28,11 @@ setopt NULL_GLOB
 # 1) New media files -> full pipeline
 for f in "$DIR"/*.wav "$DIR"/*.m4a "$DIR"/*.mp3 "$DIR"/*.mp4 "$DIR"/*.mov "$DIR"/*.aac "$DIR"/*.aiff "$DIR"/*.caf; do
   [[ -f "$f" ]] || continue
+  [[ "$f" == *.system.m4a ]] && continue                # online call track; processed with its mic file
   stem="${f:r}"
   [[ -f "${stem}.notes.md" ]] && continue               # fully processed
+  held "${stem}.hold" && continue                       # the app or a running pipeline has it
+  [[ -f "${stem}.later" ]] && continue                  # you chose "Not Now" in the app
   [[ -f "${stem}.transcript.md" ]] && continue          # transcript exists; handled in pass 2
   mtime=$(stat -f %m "$f" 2>/dev/null) || continue
   (( now - mtime < 90 )) && continue                     # still being written / app handling it
@@ -42,11 +49,17 @@ for t in "$DIR"/*.transcript.md; do
   [[ -f "$t" ]] || continue
   base="${t%.transcript.md}"
   [[ -f "${base}.notes.md" ]] && continue
+  held "${base}.hold" && continue
+  skipmark="$DIR/.${base:t}.notes-skipped"
+  [[ -f "$skipmark" ]] && continue                       # too short for minutes; don't retry
   mtime=$(stat -f %m "$t" 2>/dev/null) || continue
   (( now - mtime < 90 )) && continue
   logmsg "generating missing notes: $t"
-  if "$NOTES" "$t" >/dev/null 2>>"$LOG"; then
+  "$NOTES" "$t" >/dev/null 2>>"$LOG"; rc=$?
+  if (( rc == 0 )); then
     logmsg "notes OK: ${base}.notes.md"
+  elif (( rc == 6 )); then
+    touch "$skipmark"; logmsg "notes skipped (too little speech): $t"
   else
     logmsg "notes FAILED: $t"
   fi

@@ -7,7 +7,7 @@ BUNDLE_ID="com.jaredblack.transcribemeeting"
 
 echo "==> compiling Swift app"
 BIN="/tmp/TranscribeMeeting.bin"
-swiftc -O -parse-as-library "$KIT/TranscribeMeetingApp.swift" -o "$BIN"
+swiftc -O -parse-as-library "$KIT/TranscribeMeetingApp.swift" "$KIT/SystemAudioRecorder.swift" -o "$BIN"
 
 echo "==> assembling bundle"
 rm -rf "$APP"
@@ -29,10 +29,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.2</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSMicrophoneUsageDescription</key>
   <string>Transcribe Meeting records your meetings to create transcripts on your Mac.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Transcribe Meeting records the other side of video calls so online meetings can be transcribed on your Mac.</string>
 </dict>
 </plist>
 PLIST
